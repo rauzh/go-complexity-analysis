@@ -27,15 +27,15 @@ var Analyzer = &analysis.Analyzer{
 }
 
 var (
-	cycloover  int
-	maintunder int
-	halstead   int
-	verbose    bool
+	cycloover    int
+	maintunder   int
+	halsteadover int
+	verbose      bool
 )
 
 func init() {
 	flag.IntVar(&cycloover, "cycloover", 10, "show functions with the Cyclomatic complexity > N")
-	flag.IntVar(&halstead, "halstead", 50, "show functions with the Halstead index > N")
+	flag.IntVar(&halsteadover, "halsteadover", 50, "show functions with the Halstead index > N")
 	flag.IntVar(&maintunder, "maintunder", 20, "show functions with the Maintainability index < N")
 	flag.BoolVar(&verbose, "verbose", false, "show all complexity values")
 }
@@ -64,7 +64,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			}
 
 			halstMet := calcHalstComp(n)
-			if halstMet["difficulty"] > float64(halstead) || verbose {
+			if halstMet["difficulty"] > float64(halsteadover) || verbose {
 				npos := n.Pos()
 				p := pass.Fset.File(npos).Position(npos)
 				msg := fmt.Sprintf("func %s seems to be complex (halstead complexity=%f)\n", n.Name, halstMet["difficulty"])
