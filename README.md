@@ -13,8 +13,9 @@ $ go vet -vettool=$(which complexity) [flags] [directory/file]
 
 ## Flags
 `--cycloover`: show functions with the Cyclomatic complexity > N (default: 10)
-
+`--halsteadover`: show functions with the Cyclomatic complexity > N (default: 50)
 `--maintunder`: show functions with the Maintainability index < N (default: 20)
+`--verbose`: show all functions complexity info
 
 ## Output
 ```
