@@ -1,9 +1,11 @@
 # go-complexity-analysis
 go-complexity-analysis calculates the Cyclomatic complexities, the Halstead complexities and the Maintainability indices of golang functions.
 
+!! This is a refactored and brought to perfection fork of [shoooooman/go-complexity-analysis-action](https://github.com/shoooooman/go-complexity-analysis). Put star on his repo too!
+
 # Install
 ```sh
-$ go get github.com/rauzh/go-complexity-analysis/cmd/complexity
+$ go install github.com/rauzh/go-complexity-analysis/cmd/complexity@latest
 ```
 
 # Usage
@@ -29,12 +31,6 @@ $ go vet -vettool=$(which complexity) --cycloover 10 ./...
 $ go vet -vettool=$(which complexity) --maintunder 20 main.go
 $ go vet -vettool=$(which complexity) --cycloover 5 --maintunder 30 ./src
 ```
-
-## Github Actions
-You can use the Github Actions to execute the complexity command on Github pull requests with [reviewdog](https://github.com/reviewdog/reviewdog).
-
-See [shoooooman/go-complexity-analysis-action](https://github.com/rauzh/go-complexity-analysis-action) for the details.
-
 
 # Metrics
 ## Cyclomatic Complexity
