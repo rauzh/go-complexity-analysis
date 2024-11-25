@@ -47,7 +47,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		(*ast.FuncDecl)(nil),
 	}
 
-	os.Setenv("GOCOMPLEXITY_EXIT_CODE", "0")
+	failed := false
 
 	inspect.Preorder(nodeFilter, func(n ast.Node) {
 		switch n := n.(type) {
@@ -59,7 +59,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				msg := fmt.Sprintf("func %s seems to be complex (cyclomatic complexity=%d)\n", n.Name, cycloComp)
 				fmt.Printf("%s:%d:%d: %s", p.Filename, p.Line, p.Column, msg)
 				if !verbose {
-					os.Setenv("GOCOMPLEXITY_EXIT_CODE", "1")
+					failed = true
 				}
 			}
 
@@ -70,7 +70,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				msg := fmt.Sprintf("func %s seems to be complex (halstead complexity=%f)\n", n.Name, halstMet["difficulty"])
 				fmt.Printf("%s:%d:%d: %s", p.Filename, p.Line, p.Column, msg)
 				if !verbose {
-					os.Setenv("GOCOMPLEXITY_EXIT_CODE", "1")
+					failed = true
 				}
 			}
 
@@ -82,7 +82,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				msg := fmt.Sprintf("func %s seems to have low maintainability (maintainability index=%d)\n", n.Name, maintIdx)
 				fmt.Printf("%s:%d:%d: %s", p.Filename, p.Line, p.Column, msg)
 				if !verbose {
-					os.Setenv("GOCOMPLEXITY_EXIT_CODE", "1")
+					failed = true
 				}
 			}
 
@@ -92,6 +92,9 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		}
 	})
 
+	if failed {
+		os.Exit(1)
+	}
 	return nil, nil
 }
 
