@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"os"
 
 	"go/ast"
 	"go/token"
@@ -46,6 +47,8 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		(*ast.FuncDecl)(nil),
 	}
 
+	os.Setenv("GOCOMPLEXITY_EXIT_CODE", "0")
+
 	inspect.Preorder(nodeFilter, func(n ast.Node) {
 		switch n := n.(type) {
 		case *ast.FuncDecl:
@@ -55,6 +58,9 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				p := pass.Fset.File(npos).Position(npos)
 				msg := fmt.Sprintf("func %s seems to be complex (cyclomatic complexity=%d)\n", n.Name, cycloComp)
 				fmt.Printf("%s:%d:%d: %s", p.Filename, p.Line, p.Column, msg)
+				if !verbose {
+					os.Setenv("GOCOMPLEXITY_EXIT_CODE", "1")
+				}
 			}
 
 			halstMet := calcHalstComp(n)
@@ -63,6 +69,9 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				p := pass.Fset.File(npos).Position(npos)
 				msg := fmt.Sprintf("func %s seems to be complex (halstead complexity=%f)\n", n.Name, halstMet["difficulty"])
 				fmt.Printf("%s:%d:%d: %s", p.Filename, p.Line, p.Column, msg)
+				if !verbose {
+					os.Setenv("GOCOMPLEXITY_EXIT_CODE", "1")
+				}
 			}
 
 			loc := countLOC(pass.Fset, n)
@@ -72,6 +81,9 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				p := pass.Fset.File(npos).Position(npos)
 				msg := fmt.Sprintf("func %s seems to have low maintainability (maintainability index=%d)\n", n.Name, maintIdx)
 				fmt.Printf("%s:%d:%d: %s", p.Filename, p.Line, p.Column, msg)
+				if !verbose {
+					os.Setenv("GOCOMPLEXITY_EXIT_CODE", "1")
+				}
 			}
 
 			if verbose {
