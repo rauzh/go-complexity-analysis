@@ -13,9 +13,9 @@ import (
 	"encoding/gob"
 	"flag"
 	"fmt"
+	"go/format"
 	"go/token"
 	"go/types"
-	"io/ioutil"
 	"log"
 	"os"
 	"reflect"
@@ -30,6 +30,9 @@ import (
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/internal/analysisflags"
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/internal/analysisinternal"
+	"golang.org/x/tools/internal/diff"
+	"golang.org/x/tools/internal/robustio"
 )
 
 var (
@@ -46,6 +49,9 @@ var (
 	// Log files for optional performance tracing.
 	CPUProfile, MemProfile, Trace string
 
+	// IncludeTests indicates whether test files should be analyzed too.
+	IncludeTests = true
+
 	// Fix determines whether to apply all suggested fixes.
 	Fix bool
 )
@@ -60,6 +66,7 @@ func RegisterFlags() {
 	flag.StringVar(&CPUProfile, "cpuprofile", "", "write CPU profile to this file")
 	flag.StringVar(&MemProfile, "memprofile", "", "write memory profile to this file")
 	flag.StringVar(&Trace, "trace", "", "write trace log to this file")
+	flag.BoolVar(&IncludeTests, "test", IncludeTests, "indicates whether test files should be analyzed, too")
 
 	flag.BoolVar(&Fix, "fix", false, "apply all suggested fixes")
 }
@@ -67,6 +74,7 @@ func RegisterFlags() {
 // Run loads the packages specified by args using go/packages,
 // then applies the specified analyzers to them.
 // Analysis flags must already have been set.
+// Analyzers must be valid according to [analysis.Validate].
 // It provides most of the logic for the main functions of both the
 // singlechecker and the multi-analysis commands.
 // It returns the appropriate exit code.
@@ -126,45 +134,63 @@ func Run(args []string, analyzers []*analysis.Analyzer) (exitcode int) {
 	initial, err := load(args, allSyntax)
 	if err != nil {
 		log.Print(err)
-		return 1 // load errors
+		return 1
 	}
 
-	// Print the results.
+	pkgsExitCode := 0
+	// Print package and module errors regardless of RunDespiteErrors.
+	// Do not exit if there are errors, yet.
+	if n := packages.PrintErrors(initial); n > 0 {
+		pkgsExitCode = 1
+	}
+
+	// Run the analyzers. On each package with (transitive)
+	// errors, we run only the subset of analyzers that are
+	// marked (and whose transitive requirements are also
+	// marked) with RunDespiteErrors.
 	roots := analyze(initial, analyzers)
 
+	// Apply fixes.
 	if Fix {
-		applyFixes(roots)
+		if err := applyFixes(roots); err != nil {
+			// Fail when applying fixes failed.
+			log.Print(err)
+			return 1
+		}
 	}
 
-	return printDiagnostics(roots)
+	// Print the results. If !RunDespiteErrors and there
+	// are errors in the packages, this will have 0 exit
+	// code. Otherwise, we prefer to return exit code
+	// indicating diagnostics.
+	if diagExitCode := printDiagnostics(roots); diagExitCode != 0 {
+		return diagExitCode // there were diagnostics
+	}
+	return pkgsExitCode // package errors but no diagnostics
 }
 
-// load loads the initial packages.
+// load loads the initial packages. Returns only top-level loading
+// errors. Does not consider errors in packages.
 func load(patterns []string, allSyntax bool) ([]*packages.Package, error) {
 	mode := packages.LoadSyntax
 	if allSyntax {
 		mode = packages.LoadAllSyntax
 	}
+	mode |= packages.NeedModule
 	conf := packages.Config{
 		Mode:  mode,
-		Tests: true,
+		Tests: IncludeTests,
 	}
 	initial, err := packages.Load(&conf, patterns...)
-	if err == nil {
-		if n := packages.PrintErrors(initial); n > 1 {
-			err = fmt.Errorf("%d errors during loading", n)
-		} else if n == 1 {
-			err = fmt.Errorf("error during loading")
-		} else if len(initial) == 0 {
-			err = fmt.Errorf("%s matched no packages", strings.Join(patterns, " "))
-		}
+	if err == nil && len(initial) == 0 {
+		err = fmt.Errorf("%s matched no packages", strings.Join(patterns, " "))
 	}
-
 	return initial, err
 }
 
-// TestAnalyzer applies an analysis to a set of packages (and their
+// TestAnalyzer applies an analyzer to a set of packages (and their
 // dependencies if necessary) and returns the results.
+// The analyzer must be valid according to [analysis.Validate].
 //
 // Facts about pkg are returned in a map keyed by object; package facts
 // have a nil key.
@@ -260,7 +286,10 @@ func analyze(pkgs []*packages.Package, analyzers []*analysis.Analyzer) []*action
 	return roots
 }
 
-func applyFixes(roots []*action) {
+func applyFixes(roots []*action) error {
+	// visit all of the actions and accumulate the suggested edits.
+	paths := make(map[robustio.FileID]string)
+	editsByAction := make(map[robustio.FileID]map[*action][]diff.Edit)
 	visited := make(map[*action]bool)
 	var apply func(*action) error
 	var visitAll func(actions []*action) error
@@ -268,7 +297,9 @@ func applyFixes(roots []*action) {
 		for _, act := range actions {
 			if !visited[act] {
 				visited[act] = true
-				visitAll(act.deps)
+				if err := visitAll(act.deps); err != nil {
+					return err
+				}
 				if err := apply(act); err != nil {
 					return err
 				}
@@ -277,106 +308,177 @@ func applyFixes(roots []*action) {
 		return nil
 	}
 
-	// TODO(matloob): Is this tree business too complicated? (After all this is Go!)
-	// Just create a set (map) of edits, sort by pos and call it a day?
-	type offsetedit struct {
-		start, end int
-		newText    []byte
-	} // TextEdit using byteOffsets instead of pos
-	type node struct {
-		edit        offsetedit
-		left, right *node
-	}
-
-	var insert func(tree **node, edit offsetedit) error
-	insert = func(treeptr **node, edit offsetedit) error {
-		if *treeptr == nil {
-			*treeptr = &node{edit, nil, nil}
-			return nil
-		}
-		tree := *treeptr
-		if edit.end <= tree.edit.start {
-			return insert(&tree.left, edit)
-		} else if edit.start >= tree.edit.end {
-			return insert(&tree.right, edit)
-		}
-
-		// Overlapping text edit.
-		return fmt.Errorf("analyses applying overlapping text edits affecting pos range (%v, %v) and (%v, %v)",
-			edit.start, edit.end, tree.edit.start, tree.edit.end)
-
-	}
-
-	editsForFile := make(map[*token.File]*node)
-
 	apply = func(act *action) error {
+		editsForTokenFile := make(map[*token.File][]diff.Edit)
 		for _, diag := range act.diagnostics {
 			for _, sf := range diag.SuggestedFixes {
 				for _, edit := range sf.TextEdits {
 					// Validate the edit.
-					if edit.Pos > edit.End {
-						return fmt.Errorf(
-							"diagnostic for analysis %v contains Suggested Fix with malformed edit: pos (%v) > end (%v)",
-							act.a.Name, edit.Pos, edit.End)
+					// Any error here indicates a bug in the analyzer.
+					start, end := edit.Pos, edit.End
+					file := act.pkg.Fset.File(start)
+					if file == nil {
+						return fmt.Errorf("analysis %q suggests invalid fix: missing file info for pos (%v)",
+							act.a.Name, start)
 					}
-					file, endfile := act.pkg.Fset.File(edit.Pos), act.pkg.Fset.File(edit.End)
-					if file == nil || endfile == nil || file != endfile {
-						return (fmt.Errorf(
-							"diagnostic for analysis %v contains Suggested Fix with malformed spanning files %v and %v",
-							act.a.Name, file.Name(), endfile.Name()))
+					if !end.IsValid() {
+						end = start
 					}
-					start, end := file.Offset(edit.Pos), file.Offset(edit.End)
-
-					// TODO(matloob): Validate that edits do not affect other packages.
-					root := editsForFile[file]
-					if err := insert(&root, offsetedit{start, end, edit.NewText}); err != nil {
-						return err
+					if start > end {
+						return fmt.Errorf("analysis %q suggests invalid fix: pos (%v) > end (%v)",
+							act.a.Name, start, end)
 					}
-					editsForFile[file] = root // In case the root changed
+					if eof := token.Pos(file.Base() + file.Size()); end > eof {
+						return fmt.Errorf("analysis %q suggests invalid fix: end (%v) past end of file (%v)",
+							act.a.Name, end, eof)
+					}
+					edit := diff.Edit{
+						Start: file.Offset(start),
+						End:   file.Offset(end),
+						New:   string(edit.NewText),
+					}
+					editsForTokenFile[file] = append(editsForTokenFile[file], edit)
 				}
 			}
+		}
+
+		for f, edits := range editsForTokenFile {
+			id, _, err := robustio.GetFileID(f.Name())
+			if err != nil {
+				return err
+			}
+			if _, hasId := paths[id]; !hasId {
+				paths[id] = f.Name()
+				editsByAction[id] = make(map[*action][]diff.Edit)
+			}
+			editsByAction[id][act] = edits
 		}
 		return nil
 	}
 
-	visitAll(roots)
-
-	// Now we've got a set of valid edits for each file. Get the new file contents.
-	for f, tree := range editsForFile {
-		contents, err := ioutil.ReadFile(f.Name())
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		cur := 0 // current position in the file
-
-		var out bytes.Buffer
-
-		var recurse func(*node)
-		recurse = func(node *node) {
-			if node.left != nil {
-				recurse(node.left)
-			}
-
-			edit := node.edit
-			if edit.start > cur {
-				out.Write(contents[cur:edit.start])
-				out.Write(edit.newText)
-			}
-			cur = edit.end
-
-			if node.right != nil {
-				recurse(node.right)
-			}
-		}
-		recurse(tree)
-		// Write out the rest of the file.
-		if cur < len(contents) {
-			out.Write(contents[cur:])
-		}
-
-		ioutil.WriteFile(f.Name(), out.Bytes(), 0644)
+	if err := visitAll(roots); err != nil {
+		return err
 	}
+
+	// Validate and group the edits to each actual file.
+	editsByPath := make(map[string][]diff.Edit)
+	for id, actToEdits := range editsByAction {
+		path := paths[id]
+		actions := make([]*action, 0, len(actToEdits))
+		for act := range actToEdits {
+			actions = append(actions, act)
+		}
+
+		// Does any action create conflicting edits?
+		for _, act := range actions {
+			edits := actToEdits[act]
+			if _, invalid := validateEdits(edits); invalid > 0 {
+				name, x, y := act.a.Name, edits[invalid-1], edits[invalid]
+				return diff3Conflict(path, name, name, []diff.Edit{x}, []diff.Edit{y})
+			}
+		}
+
+		// Does any pair of different actions create edits that conflict?
+		for j := range actions {
+			for k := range actions[:j] {
+				x, y := actions[j], actions[k]
+				if x.a.Name > y.a.Name {
+					x, y = y, x
+				}
+				xedits, yedits := actToEdits[x], actToEdits[y]
+				combined := append(xedits, yedits...)
+				if _, invalid := validateEdits(combined); invalid > 0 {
+					// TODO: consider applying each action's consistent list of edits entirely,
+					// and then using a three-way merge (such as GNU diff3) on the resulting
+					// files to report more precisely the parts that actually conflict.
+					return diff3Conflict(path, x.a.Name, y.a.Name, xedits, yedits)
+				}
+			}
+		}
+
+		var edits []diff.Edit
+		for act := range actToEdits {
+			edits = append(edits, actToEdits[act]...)
+		}
+		editsByPath[path], _ = validateEdits(edits) // remove duplicates. already validated.
+	}
+
+	// Now we've got a set of valid edits for each file. Apply them.
+	for path, edits := range editsByPath {
+		// TODO(adonovan): this should really work on the same
+		// gulp from the file system that fed the analyzer (see #62292).
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		out, err := diff.ApplyBytes(contents, edits)
+		if err != nil {
+			return err
+		}
+
+		// Try to format the file.
+		if formatted, err := format.Source(out); err == nil {
+			out = formatted
+		}
+
+		if err := os.WriteFile(path, out, 0644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateEdits returns a list of edits that is sorted and
+// contains no duplicate edits. Returns the index of some
+// overlapping adjacent edits if there is one and <0 if the
+// edits are valid.
+func validateEdits(edits []diff.Edit) ([]diff.Edit, int) {
+	if len(edits) == 0 {
+		return nil, -1
+	}
+	equivalent := func(x, y diff.Edit) bool {
+		return x.Start == y.Start && x.End == y.End && x.New == y.New
+	}
+	diff.SortEdits(edits)
+	unique := []diff.Edit{edits[0]}
+	invalid := -1
+	for i := 1; i < len(edits); i++ {
+		prev, cur := edits[i-1], edits[i]
+		// We skip over equivalent edits without considering them
+		// an error. This handles identical edits coming from the
+		// multiple ways of loading a package into a
+		// *go/packages.Packages for testing, e.g. packages "p" and "p [p.test]".
+		if !equivalent(prev, cur) {
+			unique = append(unique, cur)
+			if prev.End > cur.Start {
+				invalid = i
+			}
+		}
+	}
+	return unique, invalid
+}
+
+// diff3Conflict returns an error describing two conflicting sets of
+// edits on a file at path.
+func diff3Conflict(path string, xlabel, ylabel string, xedits, yedits []diff.Edit) error {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	oldlabel, old := "base", string(contents)
+
+	xdiff, err := diff.ToUnified(oldlabel, xlabel, old, xedits, diff.DefaultContextLines)
+	if err != nil {
+		return err
+	}
+	ydiff, err := diff.ToUnified(oldlabel, ylabel, old, yedits, diff.DefaultContextLines)
+	if err != nil {
+		return err
+	}
+
+	return fmt.Errorf("conflicting edits from %s and %s on %s\nfirst edits:\n%s\nsecond edits:\n%s",
+		xlabel, ylabel, path, xdiff, ydiff)
 }
 
 // printDiagnostics prints the diagnostics for the root packages in either
@@ -523,7 +625,6 @@ type action struct {
 	deps         []*action
 	objectFacts  map[objectFactKey]analysis.Fact
 	packageFacts map[packageFactKey]analysis.Fact
-	inputs       map[*analysis.Analyzer]interface{}
 	result       interface{}
 	diagnostics  []analysis.Diagnostic
 	err          error
@@ -619,15 +720,26 @@ func (act *action) execOnce() {
 		}
 	}
 
+	module := &analysis.Module{} // possibly empty (non nil) in go/analysis drivers.
+	if mod := act.pkg.Module; mod != nil {
+		module.Path = mod.Path
+		module.Version = mod.Version
+		module.GoVersion = mod.GoVersion
+	}
+
 	// Run the analysis.
 	pass := &analysis.Pass{
-		Analyzer:          act.a,
-		Fset:              act.pkg.Fset,
-		Files:             act.pkg.Syntax,
-		OtherFiles:        act.pkg.OtherFiles,
-		Pkg:               act.pkg.Types,
-		TypesInfo:         act.pkg.TypesInfo,
-		TypesSizes:        act.pkg.TypesSizes,
+		Analyzer:     act.a,
+		Fset:         act.pkg.Fset,
+		Files:        act.pkg.Syntax,
+		OtherFiles:   act.pkg.OtherFiles,
+		IgnoredFiles: act.pkg.IgnoredFiles,
+		Pkg:          act.pkg.Types,
+		TypesInfo:    act.pkg.TypesInfo,
+		TypesSizes:   act.pkg.TypesSizes,
+		TypeErrors:   act.pkg.TypeErrors,
+		Module:       module,
+
 		ResultOf:          inputs,
 		Report:            func(d analysis.Diagnostic) { act.diagnostics = append(act.diagnostics, d) },
 		ImportObjectFact:  act.importObjectFact,
@@ -637,6 +749,7 @@ func (act *action) execOnce() {
 		AllObjectFacts:    act.allObjectFacts,
 		AllPackageFacts:   act.allPackageFacts,
 	}
+	pass.ReadFile = analysisinternal.MakeReadFile(pass)
 	act.pass = pass
 
 	var err error
@@ -649,6 +762,15 @@ func (act *action) execOnce() {
 				err = fmt.Errorf(
 					"internal error: on package %s, analyzer %s returned a result of type %v, but declared ResultType %v",
 					pass.Pkg.Path(), pass.Analyzer, got, want)
+			}
+		}
+	}
+	if err == nil { // resolve diagnostic URLs
+		for i := range act.diagnostics {
+			if url, uerr := analysisflags.ResolveURL(act.a, act.diagnostics[i]); uerr == nil {
+				act.diagnostics[i].URL = url
+			} else {
+				err = uerr // keep the last error
 			}
 		}
 	}
@@ -680,7 +802,7 @@ func inheritFacts(act, dep *action) {
 		if serialize {
 			encodedFact, err := codeFact(fact)
 			if err != nil {
-				log.Panicf("internal error: encoding of %T fact failed in %v", fact, act)
+				log.Panicf("internal error: encoding of %T fact failed in %v: %v", fact, act, err)
 			}
 			fact = encodedFact
 		}
@@ -744,7 +866,7 @@ func codeFact(fact analysis.Fact) (analysis.Fact, error) {
 
 // exportedFrom reports whether obj may be visible to a package that imports pkg.
 // This includes not just the exported members of pkg, but also unexported
-// constants, types, fields, and methods, perhaps belonging to oether packages,
+// constants, types, fields, and methods, perhaps belonging to other packages,
 // that find there way into the API.
 // This is an overapproximation of the more accurate approach used by
 // gc export data, which walks the type graph, but it's much simpler.
@@ -756,8 +878,13 @@ func exportedFrom(obj types.Object, pkg *types.Package) bool {
 		return obj.Exported() && obj.Pkg() == pkg ||
 			obj.Type().(*types.Signature).Recv() != nil
 	case *types.Var:
-		return obj.Exported() && obj.Pkg() == pkg ||
-			obj.IsField()
+		if obj.IsField() {
+			return true
+		}
+		// we can't filter more aggressively than this because we need
+		// to consider function parameters exported, but have no way
+		// of telling apart function parameters from local variables.
+		return obj.Pkg() == pkg
 	case *types.TypeName, *types.Const:
 		return true
 	}
@@ -803,7 +930,7 @@ func (act *action) exportObjectFact(obj types.Object, fact analysis.Fact) {
 func (act *action) allObjectFacts() []analysis.ObjectFact {
 	facts := make([]analysis.ObjectFact, 0, len(act.objectFacts))
 	for k := range act.objectFacts {
-		facts = append(facts, analysis.ObjectFact{k.obj, act.objectFacts[k]})
+		facts = append(facts, analysis.ObjectFact{Object: k.obj, Fact: act.objectFacts[k]})
 	}
 	return facts
 }
@@ -840,16 +967,16 @@ func (act *action) exportPackageFact(fact analysis.Fact) {
 func factType(fact analysis.Fact) reflect.Type {
 	t := reflect.TypeOf(fact)
 	if t.Kind() != reflect.Ptr {
-		log.Fatalf("invalid Fact type: got %T, want pointer", t)
+		log.Fatalf("invalid Fact type: got %T, want pointer", fact)
 	}
 	return t
 }
 
-// allObjectFacts implements Pass.AllObjectFacts.
+// allPackageFacts implements Pass.AllPackageFacts.
 func (act *action) allPackageFacts() []analysis.PackageFact {
 	facts := make([]analysis.PackageFact, 0, len(act.packageFacts))
 	for k := range act.packageFacts {
-		facts = append(facts, analysis.PackageFact{k.pkg, act.packageFacts[k]})
+		facts = append(facts, analysis.PackageFact{Package: k.pkg, Fact: act.packageFacts[k]})
 	}
 	return facts
 }
