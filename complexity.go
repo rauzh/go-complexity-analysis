@@ -29,12 +29,14 @@ var (
 	cycloover  int
 	maintunder int
 	halstead   int
+	verbose    bool
 )
 
 func init() {
 	flag.IntVar(&cycloover, "cycloover", 10, "show functions with the Cyclomatic complexity > N")
-	flag.IntVar(&halstead, "halstead", 20, "show functions with the Halstead index > N")
+	flag.IntVar(&halstead, "halstead", 50, "show functions with the Halstead index > N")
 	flag.IntVar(&maintunder, "maintunder", 20, "show functions with the Maintainability index < N")
+	flag.BoolVar(&verbose, "verbose", false, "show all complexity values")
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
@@ -48,7 +50,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		switch n := n.(type) {
 		case *ast.FuncDecl:
 			cycloComp := calcCycloComp(n)
-			if cycloComp > cycloover {
+			if cycloComp > cycloover || verbose {
 				npos := n.Pos()
 				p := pass.Fset.File(npos).Position(npos)
 				msg := fmt.Sprintf("func %s seems to be complex (cyclomatic complexity=%d)\n", n.Name, cycloComp)
@@ -56,18 +58,25 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			}
 
 			halstMet := calcHalstComp(n)
+			if halstMet["difficulty"] > float64(halstead) || verbose {
+				npos := n.Pos()
+				p := pass.Fset.File(npos).Position(npos)
+				msg := fmt.Sprintf("func %s seems to be complex (halstead complexity=%f)\n", n.Name, halstMet["difficulty"])
+				fmt.Printf("%s:%d:%d: %s", p.Filename, p.Line, p.Column, msg)
+			}
 
 			loc := countLOC(pass.Fset, n)
 			maintIdx := calcMaintIndex(halstMet["volume"], cycloComp, loc)
-			if maintIdx < maintunder {
+			if maintIdx < maintunder || verbose {
 				npos := n.Pos()
 				p := pass.Fset.File(npos).Position(npos)
 				msg := fmt.Sprintf("func %s seems to have low maintainability (maintainability index=%d)\n", n.Name, maintIdx)
 				fmt.Printf("%s:%d:%d: %s", p.Filename, p.Line, p.Column, msg)
 			}
 
-			// Only when `go test`
-			pass.Reportf(n.Pos(), "Cyclomatic complexity: %d, Halstead difficulty: %0.3f, volume: %0.3f", cycloComp, halstMet["difficulty"], halstMet["volume"])
+			if verbose {
+				pass.Reportf(n.Pos(), "Cyclomatic complexity: %d, Halstead difficulty: %0.3f, volume: %0.3f", cycloComp, halstMet["difficulty"], halstMet["volume"])
+			}
 		}
 	})
 
